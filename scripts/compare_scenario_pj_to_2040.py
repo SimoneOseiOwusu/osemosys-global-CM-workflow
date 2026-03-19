@@ -16,7 +16,7 @@ REFERENCE_FILE = REPO_ROOT / "data" / "reference" / "2040Values.xlsx"
 
 REFERENCE_YEAR = 2040
 ISO_COLUMN = "iso3"
-HIGHLIGHT_THRESHOLD = 0.05  # 5%
+HIGHLIGHT_THRESHOLD = 0.05  # highlight any % of 2040 value above 5%
 
 FILES_TO_PROCESS = [
     "AggregatedDemand_combined_node_locations_for_energy_conversion_region_unconstrained_PJ.csv",
@@ -35,6 +35,7 @@ def clean_iso(series: pd.Series) -> pd.Series:
     return series.astype(str).str.strip().str.upper()
 
 
+
 def coerce_numeric(series: pd.Series) -> pd.Series:
     cleaned = (
         series.astype(str)
@@ -43,6 +44,7 @@ def coerce_numeric(series: pd.Series) -> pd.Series:
         .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
     )
     return pd.to_numeric(cleaned, errors="coerce")
+
 
 
 def prettify_column_name(col: str) -> str:
@@ -69,6 +71,51 @@ def prettify_column_name(col: str) -> str:
     )
     base = base.replace("_", " ").title()
     return f"{base} (PJ)"
+
+
+
+def style_worksheet(ws, *, highlight_pct_of_2040_threshold: bool = False) -> None:
+    ws.freeze_panes = "B2"
+    headers = [cell.value for cell in ws[1]]
+
+    percent_cols = {
+        i + 1
+        for i, h in enumerate(headers)
+        if isinstance(h, str) and h.endswith("(% of 2040)")
+    }
+    number_cols = {
+        i + 1 for i, h in enumerate(headers)
+        if h != "ISO3" and (i + 1) not in percent_cols
+    }
+
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            if cell.column in percent_cols and isinstance(cell.value, (int, float)):
+                cell.number_format = "0.0%"
+            elif cell.column in number_cols and isinstance(cell.value, (int, float)):
+                cell.number_format = "0.00"
+
+    if highlight_pct_of_2040_threshold:
+        above_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+
+        for col_idx in percent_cols:
+            col_letter = get_column_letter(col_idx)
+            cell_range = f"{col_letter}2:{col_letter}{ws.max_row}"
+            ws.conditional_formatting.add(
+                cell_range,
+                CellIsRule(
+                    operator="greaterThan",
+                    formula=[str(HIGHLIGHT_THRESHOLD)],
+                    fill=above_fill,
+                ),
+            )
+
+    for col_idx, column_cells in enumerate(ws.columns, start=1):
+        max_length = 0
+        for cell in column_cells:
+            cell_value = "" if cell.value is None else str(cell.value)
+            max_length = max(max_length, len(cell_value))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_length + 2, 40)
 
 
 # -----------------------------
@@ -109,20 +156,25 @@ def load_reference_2040(reference_path: Path, year: int) -> pd.DataFrame:
 
 
 # -----------------------------
-# Build comparison table
+# Build tables
 # -----------------------------
-def build_comparison_table(input_path: Path, reference_df: pd.DataFrame) -> pd.DataFrame:
+def prepare_merged_table(input_path: Path, reference_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     df = pd.read_csv(input_path)
     df[ISO_COLUMN] = clean_iso(df[ISO_COLUMN])
 
     merged = df.merge(reference_df, on=ISO_COLUMN, how="left")
-
     scenario_columns = [c for c in df.columns if c not in EXCLUDED_COLUMNS]
 
     for col in scenario_columns:
         merged[col] = coerce_numeric(merged[col]).round(2)
-        pct_col = f"{col}_pct_of_2040"
-        merged[pct_col] = (merged[col] / merged["reference_2040_pj"]).round(4)
+        merged[f"{col}_pct_of_2040"] = (merged[col] / merged["reference_2040_pj"]).round(4)
+
+    return merged, scenario_columns
+
+
+
+def build_comparison_table(input_path: Path, reference_df: pd.DataFrame) -> pd.DataFrame:
+    merged, scenario_columns = prepare_merged_table(input_path, reference_df)
 
     ordered_columns = [ISO_COLUMN, "reference_2040_pj"]
     for col in scenario_columns:
@@ -131,64 +183,45 @@ def build_comparison_table(input_path: Path, reference_df: pd.DataFrame) -> pd.D
 
     result = merged[ordered_columns].copy()
     result.columns = [prettify_column_name(col) for col in result.columns]
-
     return result
+
+
+
+def build_over_5pct_summary_table(input_path: Path, reference_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create a country x scenario summary using only the existing
+    "(% of 2040)" values from the comparison table.
+
+    All percentage values are shown. Excel conditional formatting highlights
+    any value above 5%.
+    """
+    merged, scenario_columns = prepare_merged_table(input_path, reference_df)
+
+    percent_columns = [f"{col}_pct_of_2040" for col in scenario_columns]
+    ordered_columns = [ISO_COLUMN] + percent_columns
+
+    summary = merged[ordered_columns].copy().reset_index(drop=True)
+    summary.columns = [prettify_column_name(col) for col in ordered_columns]
+    return summary
 
 
 # -----------------------------
 # Excel formatting
 # -----------------------------
-def format_excel_output(output_path: Path, df: pd.DataFrame) -> None:
+def format_excel_output(
+    output_path: Path,
+    comparison_df: pd.DataFrame,
+    over_5pct_summary_df: pd.DataFrame,
+) -> None:
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="comparison")
-        ws = writer.sheets["comparison"]
+        comparison_df.to_excel(writer, index=False, sheet_name="comparison")
+        over_5pct_summary_df.to_excel(writer, index=False, sheet_name="over_5pct_summary")
 
-        ws.freeze_panes = "B2"
-
-        headers = [cell.value for cell in ws[1]]
-
-        percent_cols = {
-            i + 1 for i, h in enumerate(headers)
-            if str(h).endswith("(% of 2040)")
-        }
-        number_cols = {
-            i + 1 for i, h in enumerate(headers)
-            if h != "ISO3" and (i + 1) not in percent_cols
-        }
-
-        for row in ws.iter_rows(min_row=2):
-            for cell in row:
-                if cell.column in percent_cols and isinstance(cell.value, (int, float)):
-                    cell.number_format = "0%"
-                elif cell.column in number_cols and isinstance(cell.value, (int, float)):
-                    cell.number_format = "0.00"
-
-        # Highlight percentage cells greater than 5%
-        highlight_fill = PatternFill(
-            start_color="FFF2CC",
-            end_color="FFF2CC",
-            fill_type="solid"
+        style_worksheet(writer.sheets["comparison"])
+        style_worksheet(
+            writer.sheets["over_5pct_summary"],
+            highlight_pct_of_2040_threshold=True,
         )
-
-        for col_idx in percent_cols:
-            col_letter = get_column_letter(col_idx)
-            cell_range = f"{col_letter}2:{col_letter}{ws.max_row}"
-            ws.conditional_formatting.add(
-                cell_range,
-                CellIsRule(
-                    operator="greaterThan",
-                    formula=[str(HIGHLIGHT_THRESHOLD)],
-                    fill=highlight_fill
-                )
-            )
-
-        # Auto-width columns
-        for col_idx, column_cells in enumerate(ws.columns, start=1):
-            max_length = 0
-            for cell in column_cells:
-                cell_value = "" if cell.value is None else str(cell.value)
-                max_length = max(max_length, len(cell_value))
-            ws.column_dimensions[get_column_letter(col_idx)].width = min(max_length + 2, 40)
 
 
 # -----------------------------
@@ -196,7 +229,13 @@ def format_excel_output(output_path: Path, df: pd.DataFrame) -> None:
 # -----------------------------
 def compare_file(input_path: Path, output_path: Path, reference_df: pd.DataFrame) -> None:
     comparison_df = build_comparison_table(input_path, reference_df)
-    format_excel_output(output_path, comparison_df)
+    over_5pct_summary_df = build_over_5pct_summary_table(input_path, reference_df)
+
+    format_excel_output(
+        output_path,
+        comparison_df,
+        over_5pct_summary_df,
+    )
     print(f"Created: {output_path}")
 
 
@@ -233,4 +272,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main() 
+    main()
+ 
