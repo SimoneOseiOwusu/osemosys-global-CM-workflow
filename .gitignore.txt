@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment files
+.env
+
+# macOS
+.DS_Store
+
+# Project data and outputs
+data/
+outputs/
+
+# Optional: model results or temporary files
+results/
+tmp/
