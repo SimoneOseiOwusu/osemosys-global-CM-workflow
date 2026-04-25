@@ -179,3 +179,20 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# =========================
+# OSeMOSYS Global outputs
+# =========================
+
+# Model results (VERY large)
+external/osemosys_global/results/
+external/osemosys_global/.snakemake/
+external/osemosys_global/gurobi.log
+
+# Your generated outputs
+outputs/scenario_runs/
+outputs/pj_converted/
+outputs/pct_of_2040/
+
+# Generated demand scenarios
+data/generated/
