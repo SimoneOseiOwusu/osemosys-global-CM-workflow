@@ -1,251 +1,359 @@
+#!/usr/bin/env python3
+"""
+Build revised OSeMOSYS specified_annual_demand.csv files using ADDITIVE demand logic
+and explicit post-2040 growth.
+
+Corrected logic
+---------------
+Scenario values are treated as additional demand, not total demand:
+
+    revised_2040 = baseline_2040 + scenario_additional_2040
+
+Then for years after 2040:
+
+    revised_year = revised_2040 * (1 + post_target_growth_rate) ** years_after_2040
+
+Default post-target growth rate is 2%.
+
+This avoids the issue where 2041-2050 reverted to old/static baseline values.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
 from pathlib import Path
+
 import pandas as pd
 
 
-# ============================================================
-# Paths and settings
-# ============================================================
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-COMPARISON_DIR = REPO_ROOT / "outputs" / "pct_of_2040"
+DEFAULT_BASELINE = REPO_ROOT / "data" / "baseline" / "specified_annual_demand.csv"
+DEFAULT_COMPARISON_DIR = REPO_ROOT / "outputs" / "pct_of_2040"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "data" / "generated"
 
-BASELINE_FILE = (
-    REPO_ROOT
-    / "external"
-    / "osemosys_global"
-    / "resources"
-    / "data"
-    / "custom"
-    / "specified_annual_demand.csv"
-)
-
-OUTPUT_DIR = REPO_ROOT / "data" / "generated"
-
-# The comparison workbook stores percentage columns as ratios, e.g. 0.06 = 6%.
-THRESHOLD_RATIO = 0.05
-THRESHOLD_PERCENT = THRESHOLD_RATIO * 100
-AUDIT_COLUMNS = ["scenario", "iso3", "custom_node", "pct_of_2040"]
-
-# If multiple comparison workbooks exist, choose the one that matches your original
-# manual workflow. Change this if you want region_constrained, region_unconstrained, etc.
-PREFERRED_COMPARISON_KEYWORD = "country_constrained"
-SUMMARY_SHEET = "over_5pct_summary"
+TARGET_YEAR_DEFAULT = 2040
+DEFAULT_POST_TARGET_GROWTH_RATE = 0.02
+COMPARISON_SHEET = "comparison"
 
 
-# ============================================================
-# Helper functions
-# ============================================================
-
-def clean_name(name):
+def clean_scenario_name(name: str) -> str:
     return (
         str(name)
+        .strip()
         .replace(" ", "_")
         .replace("/", "_")
+        .replace("\\", "_")
         .replace("(", "")
         .replace(")", "")
         .replace("%", "pct")
+        .replace("-", "_")
         .replace("__", "_")
         .strip("_")
     )
 
 
-def parse_ratio(value):
-    """
-    Return a ratio, where 0.05 means 5%.
-
-    Handles Excel percentage values that are read as decimals, strings such as
-    '5%', and accidental percent-point values such as 5.
-    """
-    if pd.isna(value):
-        return 0.0
-
-    if isinstance(value, str):
-        cleaned = value.replace("%", "").strip()
-        if cleaned == "":
-            return 0.0
-        numeric = float(cleaned)
-        return numeric / 100 if "%" in value else numeric
-
-    numeric = float(value)
-
-    # Defensive fallback: if a value larger than 1 appears in a percentage column,
-    # treat it as percent points rather than a ratio.
-    if numeric > 1:
-        return numeric / 100
-
-    return numeric
+def iso_to_custom_node(iso3: str) -> str:
+    return f"{str(iso3).strip().upper()}XX"
 
 
-def iso_to_node(iso):
-    return f"{str(iso).strip().upper()}XX"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build revised demand inputs using baseline + scenario demand + post-2040 growth."
+    )
+    parser.add_argument(
+        "--baseline-file",
+        type=Path,
+        default=DEFAULT_BASELINE,
+        help="Clean baseline specified_annual_demand.csv. Default: data/baseline/specified_annual_demand.csv",
+    )
+    parser.add_argument(
+        "--comparison-file",
+        type=Path,
+        default=None,
+        help="Specific comparison workbook to use. If omitted, script picks one from outputs/pct_of_2040.",
+    )
+    parser.add_argument(
+        "--comparison-dir",
+        type=Path,
+        default=DEFAULT_COMPARISON_DIR,
+        help="Folder containing comparison Excel files. Default: outputs/pct_of_2040",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Output folder. Default: data/generated",
+    )
+    parser.add_argument(
+        "--target-year",
+        type=int,
+        default=TARGET_YEAR_DEFAULT,
+        help="Year to revise. Default: 2040",
+    )
+    parser.add_argument(
+        "--post-target-growth-rate",
+        type=float,
+        default=DEFAULT_POST_TARGET_GROWTH_RATE,
+        help="Annual growth rate after target year. Default: 0.02 = 2 percent.",
+    )
+    parser.add_argument(
+        "--preferred-keyword",
+        default="country_unconstrained",
+        help="Keyword used to choose comparison workbook if multiple exist. Default: country_unconstrained",
+    )
+    parser.add_argument(
+        "--clear-output",
+        action="store_true",
+        help="Delete existing data/generated before writing new scenario folders.",
+    )
+    parser.add_argument(
+        "--include-reference",
+        action="store_true",
+        help="Also generate Reference_2040_PJ if Reference 2040 (PJ) exists. Usually leave this off.",
+    )
+    parser.add_argument(
+        "--countries",
+        nargs="*",
+        default=None,
+        help="Optional ISO3 countries to update. Example: --countries ZAF KEN AGO",
+    )
+    return parser.parse_args()
 
 
-def apply_growth(country_df, pct_percent):
-    """
-    Increase 2040 demand by pct_percent, then preserve the baseline growth ratios
-    for all years after 2040.
-    """
-    country_df = country_df.copy()
+def choose_comparison_file(args: argparse.Namespace) -> Path:
+    if args.comparison_file:
+        if not args.comparison_file.exists():
+            raise FileNotFoundError(f"Comparison file not found: {args.comparison_file}")
+        return args.comparison_file
 
-    base_2040 = country_df.loc[country_df["YEAR"] == 2040, "VALUE"]
+    files = sorted(args.comparison_dir.glob("*.xlsx"))
+    if not files:
+        raise FileNotFoundError(f"No .xlsx files found in {args.comparison_dir}")
 
-    if base_2040.empty:
-        return country_df
-
-    new_2040 = base_2040.iloc[0] * (1 + pct_percent / 100)
-    country_df.loc[country_df["YEAR"] == 2040, "VALUE"] = new_2040
-
-    years_after_2040 = sorted(country_df.loc[country_df["YEAR"] > 2040, "YEAR"].unique())
-
-    previous_year = 2040
-    previous_value = new_2040
-
-    for year in years_after_2040:
-        old_previous = country_df.loc[country_df["YEAR"] == previous_year, "VALUE"].iloc[0]
-        old_current = country_df.loc[country_df["YEAR"] == year, "VALUE"].iloc[0]
-
-        growth_rate = 0 if old_previous == 0 else old_current / old_previous
-        new_value = previous_value * growth_rate
-
-        country_df.loc[country_df["YEAR"] == year, "VALUE"] = new_value
-
-        previous_year = year
-        previous_value = new_value
-
-    return country_df
+    preferred = [p for p in files if args.preferred_keyword in p.name]
+    return preferred[0] if preferred else files[0]
 
 
-def choose_comparison_file() -> Path:
-    comparison_files = sorted(COMPARISON_DIR.glob("*.xlsx"))
-
-    if not comparison_files:
-        raise FileNotFoundError(f"No comparison Excel files found in: {COMPARISON_DIR}")
-
-    preferred = [p for p in comparison_files if PREFERRED_COMPARISON_KEYWORD in p.name]
-    return preferred[0] if preferred else comparison_files[0]
-
-
-def load_percentage_summary(comparison_file: Path) -> pd.DataFrame:
-    """
-    Load the percentage-only sheet. This avoids treating PJ value columns as
-    percentage columns.
-    """
-    try:
-        comp = pd.read_excel(comparison_file, sheet_name=SUMMARY_SHEET)
-    except ValueError:
-        # Fallback for older workbooks: read the first sheet but only keep columns
-        # that explicitly end with '(% of 2040)'.
-        comp = pd.read_excel(comparison_file)
-
-    return comp
-
-
-def find_iso_column(comp: pd.DataFrame) -> str:
-    for possible_col in ["iso3", "ISO3", "country", "Country"]:
-        if possible_col in comp.columns:
-            return possible_col
-
-    raise ValueError("Could not find an ISO/country column in the comparison file.")
-
-
-def find_scenario_percent_columns(comp: pd.DataFrame, iso_col: str) -> list[str]:
-    scenario_cols = [
-        col for col in comp.columns
-        if col != iso_col and str(col).endswith("(% of 2040)")
-    ]
-
-    if not scenario_cols:
-        raise ValueError(
-            "No scenario percentage columns ending with '(% of 2040)' were found. "
-            f"Check sheet '{SUMMARY_SHEET}' in the comparison workbook."
+def load_baseline(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Baseline demand file not found: {path}\n\n"
+            "Create it first, for example:\n"
+            "  mkdir -p data/baseline\n"
+            "  cp external/osemosys_global/resources/data/custom/specified_annual_demand.csv "
+            "data/baseline/specified_annual_demand.csv\n\n"
+            "Use a clean reference baseline file, not a scenario output."
         )
 
-    return scenario_cols
+    df = pd.read_csv(path)
+    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")].copy()
+
+    required = {"CUSTOM_NODE", "YEAR", "VALUE"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Baseline file missing required columns: {sorted(missing)}")
+
+    df["CUSTOM_NODE"] = df["CUSTOM_NODE"].astype(str).str.strip().str.upper()
+    df["YEAR"] = pd.to_numeric(df["YEAR"], errors="raise").astype(int)
+    df["VALUE"] = pd.to_numeric(df["VALUE"], errors="raise")
+
+    return df
 
 
-def validate_baseline(baseline: pd.DataFrame) -> None:
-    for col in ["CUSTOM_NODE", "YEAR", "VALUE"]:
-        if col not in baseline.columns:
-            raise ValueError(f"Baseline file is missing required column: {col}")
+def load_comparison(path: Path) -> pd.DataFrame:
+    try:
+        df = pd.read_excel(path, sheet_name=COMPARISON_SHEET)
+    except ValueError:
+        df = pd.read_excel(path, sheet_name=0)
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    iso_col = None
+    for candidate in ["ISO3", "iso3", "Iso3", "Country", "country"]:
+        if candidate in df.columns:
+            iso_col = candidate
+            break
+
+    if iso_col is None:
+        raise ValueError(f"Could not find ISO3/country column in {path}")
+
+    df = df.rename(columns={iso_col: "ISO3"})
+    df["ISO3"] = df["ISO3"].astype(str).str.strip().str.upper()
+
+    return df
 
 
-# ============================================================
-# Main workflow
-# ============================================================
+def scenario_columns(comp: pd.DataFrame, include_reference: bool) -> list[str]:
+    cols = [c for c in comp.columns if str(c).endswith(" (PJ)")]
 
-def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if not include_reference:
+        cols = [c for c in cols if c != "Reference 2040 (PJ)"]
 
-    comparison_file = choose_comparison_file()
-    print(f"Using comparison file: {comparison_file}")
-    print(f"Using comparison sheet: {SUMMARY_SHEET}")
+    cols = [c for c in cols if c != "2022 Baseline (PJ)"]
 
-    if not BASELINE_FILE.exists():
-        raise FileNotFoundError(f"Baseline demand file not found: {BASELINE_FILE}")
+    if not cols:
+        raise ValueError("No scenario columns ending in ' (PJ)' found in comparison workbook.")
 
-    comp = load_percentage_summary(comparison_file)
-    baseline = pd.read_csv(BASELINE_FILE)
+    return cols
 
-    iso_col = find_iso_column(comp)
-    validate_baseline(baseline)
-    scenario_cols = find_scenario_percent_columns(comp, iso_col)
 
-    for scenario in scenario_cols:
-        scenario_name = str(scenario).replace(" (% of 2040)", "")
-        scenario_folder_name = clean_name(scenario_name)
+def scenario_name_from_pj_col(col: str) -> str:
+    return str(col).removesuffix(" (PJ)").strip()
 
-        print(f"\nScenario: {scenario_name}")
+
+def get_ratio_value(row: pd.Series, scenario_name: str):
+    ratio_col = f"{scenario_name} (% of 2040)"
+    if ratio_col not in row.index:
+        return None
+
+    value = row[ratio_col]
+    if pd.isna(value):
+        return None
+
+    if isinstance(value, str):
+        txt = value.strip().replace("%", "")
+        if not txt:
+            return None
+        val = float(txt)
+        return val / 100 if "%" in value else val
+
+    return float(value)
+
+
+def apply_additional_demand_with_growth(
+    scenario_df: pd.DataFrame,
+    custom_node: str,
+    target_year: int,
+    additional_value: float,
+    post_target_growth_rate: float,
+):
+    """
+    Keep pre-target years unchanged.
+    Add scenario value to target year.
+    For years after target year, grow from revised target year using fixed growth rate.
+    """
+    mask = scenario_df["CUSTOM_NODE"] == custom_node
+    node_df = scenario_df.loc[mask].sort_values("YEAR").copy()
+
+    if node_df.empty:
+        return None, None, {}, "node_not_found"
+
+    if target_year not in set(node_df["YEAR"]):
+        return None, None, {}, "target_year_not_found"
+
+    baseline_target = float(node_df.loc[node_df["YEAR"] == target_year, "VALUE"].iloc[0])
+    revised_target = baseline_target + float(additional_value)
+
+    scenario_df.loc[mask & (scenario_df["YEAR"] == target_year), "VALUE"] = revised_target
+
+    years_after = sorted(node_df.loc[node_df["YEAR"] > target_year, "YEAR"].unique())
+    revised_after = {}
+
+    for year in years_after:
+        n = int(year) - int(target_year)
+        new_value = revised_target * ((1.0 + post_target_growth_rate) ** n)
+        scenario_df.loc[mask & (scenario_df["YEAR"] == year), "VALUE"] = new_value
+        revised_after[int(year)] = float(new_value)
+
+    return baseline_target, revised_target, revised_after, "updated"
+
+
+def main() -> None:
+    args = parse_args()
+
+    comparison_file = choose_comparison_file(args)
+    baseline = load_baseline(args.baseline_file)
+    comp = load_comparison(comparison_file)
+
+    country_filter = {c.upper() for c in args.countries} if args.countries else None
+
+    if args.clear_output and args.output_dir.exists():
+        shutil.rmtree(args.output_dir)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    pj_cols = scenario_columns(comp, include_reference=args.include_reference)
+
+    print(f"Using baseline: {args.baseline_file}")
+    print(f"Using comparison workbook: {comparison_file}")
+    print(f"Target year: {args.target_year}")
+    print("Mode: ADD scenario PJ value to baseline target-year demand")
+    print(f"Post-target growth rate: {args.post_target_growth_rate:.4f}")
+    print(f"Scenarios found: {len(pj_cols)}")
+
+    all_audit = []
+
+    for pj_col in pj_cols:
+        scenario_name = scenario_name_from_pj_col(pj_col)
+        scenario_folder = clean_scenario_name(scenario_name)
 
         scenario_df = baseline.copy()
-
-        flagged = comp[[iso_col, scenario]].copy()
-        flagged[iso_col] = flagged[iso_col].astype(str).str.strip().str.upper()
-        flagged["ratio"] = flagged[scenario].apply(parse_ratio)
-        flagged = flagged[flagged["ratio"] > THRESHOLD_RATIO]
-
-        print(f"Flagged countries (> {THRESHOLD_PERCENT:.1f}%): {len(flagged)}")
-
         audit_rows = []
 
-        for _, row in flagged.iterrows():
-            iso = row[iso_col]
-            node = iso_to_node(iso)
-            pct_percent = row["ratio"] * 100
+        print(f"\nBuilding scenario: {scenario_name}")
 
-            mask = scenario_df["CUSTOM_NODE"] == node
-            country_df = scenario_df.loc[mask].copy()
-
-            if country_df.empty:
-                print(f"Skipping {iso}: node {node} not found")
+        for _, row in comp.iterrows():
+            iso3 = str(row["ISO3"]).strip().upper()
+            if country_filter and iso3 not in country_filter:
                 continue
 
-            updated = apply_growth(country_df, pct_percent)
-            scenario_df.loc[mask, "VALUE"] = updated["VALUE"].values
+            if pd.isna(row[pj_col]):
+                continue
 
-            audit_rows.append(
-                {
-                    "scenario": scenario_name,
-                    "iso3": iso,
-                    "custom_node": node,
-                    "pct_of_2040": pct_percent,
-                }
+            custom_node = iso_to_custom_node(iso3)
+            additional_demand = float(row[pj_col])
+            ratio = get_ratio_value(row, scenario_name)
+
+            baseline_target, revised_target, revised_after, status = apply_additional_demand_with_growth(
+                scenario_df=scenario_df,
+                custom_node=custom_node,
+                target_year=args.target_year,
+                additional_value=additional_demand,
+                post_target_growth_rate=args.post_target_growth_rate,
             )
 
-        out_folder = OUTPUT_DIR / scenario_folder_name
-        out_folder.mkdir(parents=True, exist_ok=True)
+            audit = {
+                "scenario": scenario_name,
+                "iso3": iso3,
+                "custom_node": custom_node,
+                "target_year": args.target_year,
+                "status": status,
+                "baseline_target_value": baseline_target if baseline_target is not None else "",
+                "additional_scenario_demand": additional_demand,
+                "revised_target_value": revised_target if revised_target is not None else "",
+                "post_target_growth_rate": args.post_target_growth_rate,
+                "revised_2050_value": revised_after.get(2050, "") if revised_after else "",
+                "ratio_of_reference_2040_from_workbook": ratio if ratio is not None else "",
+                "pct_increase_vs_baseline_target": (
+                    additional_demand / baseline_target if baseline_target not in [None, 0] else ""
+                ),
+            }
 
-        demand_file = out_folder / "specified_annual_demand.csv"
-        audit_file = out_folder / "audit.csv"
+            audit_rows.append(audit)
+            all_audit.append(audit)
 
-        scenario_df.to_csv(demand_file, index=False)
+        out_dir = args.output_dir / scenario_folder
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Always write headers, even when there are zero flagged countries.
-        # This prevents pandas.errors.EmptyDataError in the runner.
-        pd.DataFrame(audit_rows, columns=AUDIT_COLUMNS).to_csv(audit_file, index=False)
+        demand_out = out_dir / "specified_annual_demand.csv"
+        audit_out = out_dir / "audit.csv"
 
-        print(f"Saved: {demand_file}")
-        print(f"Saved: {audit_file}")
+        scenario_df.to_csv(demand_out, index=False)
+        pd.DataFrame(audit_rows).to_csv(audit_out, index=False)
+
+        print(f"Updated countries: {sum(1 for r in audit_rows if r['status'] == 'updated')}")
+        print(f"Saved demand: {demand_out}")
+        print(f"Saved audit:  {audit_out}")
+
+    all_audit_path = args.output_dir / "_demand_generation_audit_all.csv"
+    pd.DataFrame(all_audit).to_csv(all_audit_path, index=False)
+
+    print(f"\nSaved combined audit: {all_audit_path}")
+    print("\nNext sense check:")
+    print("  python scripts/check_generated_demand.py --country ZAF")
+    print("  grep ZAF data/generated/Bau_2040_Low_Min_Threshold/specified_annual_demand.csv")
 
 
 if __name__ == "__main__":
